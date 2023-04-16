@@ -1,32 +1,31 @@
+import os
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-import os
-from pytorch3d.structures import Meshes
+from pytorch3d.ops import interpolate_face_attributes
 from pytorch3d.renderer import (
-    look_at_view_transform,
-    PerspectiveCameras,
-    FoVPerspectiveCameras,
-    PointLights,
     DirectionalLights,
+    FoVPerspectiveCameras,
     Materials,
-    RasterizationSettings,
-    MeshRenderer,
     MeshRasterizer,
+    MeshRenderer,
+    PerspectiveCameras,
+    PointLights,
+    RasterizationSettings,
     SoftPhongShader,
     TexturesUV,
     TexturesVertex,
-    blending
+    blending,
+    look_at_view_transform,
 )
-
-from pytorch3d.ops import interpolate_face_attributes
-
 from pytorch3d.renderer.blending import (
     BlendParams,
     hard_rgb_blend,
     sigmoid_alpha_blend,
     softmax_rgb_blend,
 )
+from pytorch3d.structures import Meshes
 
 
 class SoftSimpleShader(nn.Module):
@@ -44,8 +43,7 @@ class SoftSimpleShader(nn.Module):
         self, device="cpu", cameras=None, lights=None, materials=None, blend_params=None
     ):
         super().__init__()
-        self.lights = lights if lights is not None else PointLights(
-            device=device)
+        self.lights = lights if lights is not None else PointLights(device=device)
         self.materials = (
             materials if materials is not None else Materials(device=device)
         )
@@ -60,7 +58,6 @@ class SoftSimpleShader(nn.Module):
         return self
 
     def forward(self, fragments, meshes, **kwargs) -> torch.Tensor:
-
         texels = meshes.sample_textures(fragments)
         blend_params = kwargs.get("blend_params", self.blend_params)
 
@@ -78,7 +75,14 @@ class SoftSimpleShader(nn.Module):
 
 
 class Render_3DMM(nn.Module):
-    def __init__(self, focal=1015, img_h=500, img_w=500, batch_size=1, device=torch.device('cuda:0')):
+    def __init__(
+        self,
+        focal=1015,
+        img_h=500,
+        img_w=500,
+        batch_size=1,
+        device=torch.device("cuda:0"),
+    ):
         super(Render_3DMM, self).__init__()
 
         self.focal = focal
@@ -88,17 +92,17 @@ class Render_3DMM(nn.Module):
         self.renderer = self.get_render(batch_size)
 
         dir_path = os.path.dirname(os.path.realpath(__file__))
-        topo_info = np.load(os.path.join(
-            dir_path, '3DMM', 'topology_info.npy'), allow_pickle=True).item()
-        self.tris = torch.as_tensor(topo_info['tris']).to(self.device)
-        self.vert_tris = torch.as_tensor(
-            topo_info['vert_tris']).to(self.device)
+        topo_info = np.load(
+            os.path.join(dir_path, "3DMM", "topology_info.npy"), allow_pickle=True
+        ).item()
+        self.tris = torch.as_tensor(topo_info["tris"]).to(self.device)
+        self.vert_tris = torch.as_tensor(topo_info["vert_tris"]).to(self.device)
 
     def compute_normal(self, geometry):
         vert_1 = torch.index_select(geometry, 1, self.tris[:, 0])
         vert_2 = torch.index_select(geometry, 1, self.tris[:, 1])
         vert_3 = torch.index_select(geometry, 1, self.tris[:, 2])
-        nnorm = torch.cross(vert_2-vert_1, vert_3-vert_1, 2)
+        nnorm = torch.cross(vert_2 - vert_1, vert_3 - vert_1, 2)
         tri_normal = nn.functional.normalize(nnorm, dim=2)
         v_norm = tri_normal[:, self.vert_tris, :].sum(2)
         vert_normal = v_norm / v_norm.norm(dim=2).unsqueeze(2)
@@ -110,39 +114,39 @@ class Render_3DMM(nn.Module):
         R = R.repeat(batch_size, 1, 1)
         T = torch.zeros((batch_size, 3), dtype=torch.float32).to(self.device)
 
-        cameras = FoVPerspectiveCameras(device=self.device, R=R, T=T, znear=0.01, zfar=20,
-                                        fov=2*np.arctan(self.img_w//2/self.focal)*180./np.pi)
+        cameras = FoVPerspectiveCameras(
+            device=self.device,
+            R=R,
+            T=T,
+            znear=0.01,
+            zfar=20,
+            fov=2 * np.arctan(self.img_w // 2 / self.focal) * 180.0 / np.pi,
+        )
         lights = PointLights(
             device=self.device,
             location=[[0.0, 0.0, 1e5]],
             ambient_color=[[1, 1, 1]],
-            specular_color=[[0., 0., 0.]],
-            diffuse_color=[[0., 0., 0.]]
+            specular_color=[[0.0, 0.0, 0.0]],
+            diffuse_color=[[0.0, 0.0, 0.0]],
         )
         sigma = 1e-4
         raster_settings = RasterizationSettings(
             image_size=(self.img_h, self.img_w),
-            blur_radius=np.log(1. / 1e-4 - 1.)*sigma / 18.0,
+            blur_radius=np.log(1.0 / 1e-4 - 1.0) * sigma / 18.0,
             faces_per_pixel=2,
             perspective_correct=False,
         )
         blend_params = blending.BlendParams(background_color=[0, 0, 0])
         renderer = MeshRenderer(
-            rasterizer=MeshRasterizer(
-                raster_settings=raster_settings,
-                cameras=cameras
-            ),
+            rasterizer=MeshRasterizer(raster_settings=raster_settings, cameras=cameras),
             shader=SoftSimpleShader(
-                lights=lights,
-                blend_params=blend_params,
-                cameras=cameras
+                lights=lights, blend_params=blend_params, cameras=cameras
             ),
         )
         return renderer.to(self.device)
 
     @staticmethod
     def Illumination_layer(face_texture, norm, gamma):
-
         n_b, num_vertex, _ = face_texture.size()
         n_v_full = n_b * num_vertex
         gamma = gamma.view(-1, 3, 9).clone()
@@ -184,8 +188,107 @@ class Render_3DMM(nn.Module):
         face_normal = self.compute_normal(rott_geometry)
         face_color = self.Illumination_layer(texture, face_normal, diffuse_sh)
         face_color = TexturesVertex(face_color)
-        mesh = Meshes(rott_geometry, self.tris.float().repeat(
-            rott_geometry.shape[0], 1, 1), face_color)
+        mesh = Meshes(
+            rott_geometry,
+            self.tris.float().repeat(rott_geometry.shape[0], 1, 1),
+            face_color,
+        )
+        rendered_img = self.renderer(mesh)
+        rendered_img = torch.clamp(rendered_img, 0, 255)
+
+        return rendered_img
+
+
+def get_camera(focal, img_h, img_w, device):
+    half_s = img_w * 0.5
+    batch_size = 1
+    R, T = look_at_view_transform(10, 0, 0)
+    R = R.repeat(batch_size, 1, 1)
+    T = torch.zeros((batch_size, 3), dtype=torch.float32).to(device)
+
+    cameras = FoVPerspectiveCameras(
+        device=device,
+        R=R,
+        T=T,
+        znear=0.01,
+        zfar=20,
+        fov=2 * np.arctan(img_w // 2 / focal) * 180.0 / np.pi,
+    )
+    return cameras
+
+
+class Render_3DMM_no_tex(nn.Module):
+    def __init__(
+        self,
+        # focal=1015,
+        img_h=500,
+        img_w=500,
+        camera=None,
+        batch_size=1,
+        faces_verts_idx=None,
+        device=torch.device("cuda:0"),
+    ):
+        super(Render_3DMM_no_tex, self).__init__()
+
+        # self.focal = focal
+        self.img_h = img_h
+        self.img_w = img_w
+        self.cameras = camera
+        self.device = device
+        self.renderer = self.get_render(batch_size)
+
+        dir_path = os.path.dirname(os.path.realpath(__file__))
+        topo_info = np.load(
+            os.path.join(dir_path, "3DMM", "topology_info.npy"), allow_pickle=True
+        ).item()
+        self.faces_verts_idx = faces_verts_idx.to(self.device)
+
+    def get_render(self, batch_size=1):
+        # half_s = self.img_w * 0.5
+        # R, T = look_at_view_transform(10, 0, 0)
+        # R = R.repeat(batch_size, 1, 1)
+        # T = torch.zeros((batch_size, 3), dtype=torch.float32).to(self.device)
+        #
+        # cameras = FoVPerspectiveCameras(
+        #     device=self.device,
+        #     R=R,
+        #     T=T,
+        #     znear=0.01,
+        #     zfar=20,
+        #     fov=2 * np.arctan(self.img_w // 2 / self.focal) * 180.0 / np.pi,
+        # )
+        cameras = self.cameras
+        lights = PointLights(
+            device=self.device,
+            location=[[0.0, 0.0, 1e5]],
+            ambient_color=[[1, 1, 1]],
+            specular_color=[[0.0, 0.0, 0.0]],
+            diffuse_color=[[0.0, 0.0, 0.0]],
+        )
+        sigma = 1e-4
+        raster_settings = RasterizationSettings(
+            image_size=(self.img_h, self.img_w),
+            blur_radius=np.log(1.0 / 1e-4 - 1.0) * sigma / 18.0,
+            faces_per_pixel=2,
+            perspective_correct=False,
+        )
+        blend_params = blending.BlendParams(background_color=[0, 0, 0])
+        renderer = MeshRenderer(
+            rasterizer=MeshRasterizer(raster_settings=raster_settings, cameras=cameras),
+            shader=SoftSimpleShader(
+                lights=lights, blend_params=blend_params, cameras=cameras
+            ),
+        )
+        return renderer.to(self.device)
+
+    def forward(self, rott_geometry):
+        # face_normal = self.compute_normal(rott_geometry)
+        face_color = TexturesVertex(255 * torch.ones_like(rott_geometry))
+        mesh = Meshes(
+            rott_geometry,
+            self.faces_verts_idx,
+            face_color,
+        )
         rendered_img = self.renderer(mesh)
         rendered_img = torch.clamp(rendered_img, 0, 255)
 

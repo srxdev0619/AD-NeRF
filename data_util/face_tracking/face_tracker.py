@@ -7,15 +7,18 @@ from pathlib import Path
 import cv2
 import einops
 import numpy as np
+import skimage.io as io
 import torch
+import tqdm
 from numpy.core.numeric import require
 from numpy.lib.function_base import quantile
+from pytorch3d.io import load_obj
 
 import FLAME
 from config import cfg as deca_cfg
 from data_loader import load_dir
 from facemodel import Face_3DMM
-from render_3dmm import Render_3DMM
+from render_3dmm import Render_3DMM, Render_3DMM_no_tex, get_camera
 from util import *
 
 CFG_DATA_DIR = "/home/shahrukh/Projects/"
@@ -49,6 +52,7 @@ deca_cfg.model.tex_path = os.path.join(
     deca_cfg.deca_dir, "data", "FLAME_albedo_from_BFM.npz"
 )
 deca_cfg.model.flame_tex_path = f"{CFG_DATA_DIR}/FLAME2020/FLAME_texture.npz"
+deca_cfg.model.topology_path = "/home/shahrukh/Projects/DECA/data/head_template.obj"
 deca_cfg.model.tex_type = "FLAME"  # BFM, FLAME, albedoMM
 deca_cfg.model.n_shape = 300
 deca_cfg.model.n_exp = 100
@@ -81,6 +85,7 @@ end_id = args.frame_num
 
 id_dir = os.path.join("dataset", args.idname)
 lms, img_paths = load_dir(os.path.join(id_dir, "ori_imgs"), start_id, end_id)
+print(f"LMS MaxMin: {lms.max()}, {lms.min()}")
 num_frames = lms.shape[0]
 h, w = args.img_h, args.img_w
 cxy = torch.tensor((w / 2.0, h / 2.0), dtype=torch.float).cuda()
@@ -97,7 +102,8 @@ sel_num = sel_ids.shape[0]
 arg_focal = 1600
 arg_landis = 1e5
 
-for focal in range(600, 1500, 100):
+# for focal in range(600, 1500, 100):
+for focal in [600]:
     id_para = lms.new_zeros((1, id_dim), requires_grad=True).to(device)
     exp_para = lms.new_zeros((sel_num, exp_dim), requires_grad=True).to(device)
     pose_global = lms.new_zeros((sel_num, 3), requires_grad=False).to(device)
@@ -113,7 +119,7 @@ for focal in range(600, 1500, 100):
 
     optimizer_idexp = torch.optim.Adam([id_para, exp_para], lr=0.1)
     optimizer_frame = torch.optim.Adam([euler_angle, trans], lr=0.1)
-
+    camera = get_camera(focal, img_h=h, img_w=w, device=device)
     for iter in range(2000):
         id_para_batch = einops.repeat(id_para, "b d -> (repeat b) d", repeat=sel_num)
         pose_var = torch.cat([pose_global, pose_jaw], dim=-1)
@@ -124,7 +130,9 @@ for focal in range(600, 1500, 100):
             translation=trans_flame,
         )
         geometry = T_ROT_Y.transform_points(_geometry)
-        proj_geo = forward_transform(geometry, euler_angle, trans, focal_length, cxy)
+        # proj_geo = forward_transform(geometry, euler_angle, trans, focal_length, cxy)
+        rott_geo = forward_rott(geometry, euler_angle, trans)
+        proj_geo = camera.transform_points_screen(rott_geo, image_size=((h, w),))
         loss_lan = cal_lan_loss(proj_geo[:, :, :2], lms[sel_ids].detach())
         loss = loss_lan
         optimizer_frame.zero_grad()
@@ -143,7 +151,9 @@ for focal in range(600, 1500, 100):
             translation=trans_flame,
         )
         geometry = T_ROT_Y.transform_points(_geometry)
-        proj_geo = forward_transform(geometry, euler_angle, trans, focal_length, cxy)
+        # proj_geo = forward_transform(geometry, euler_angle, trans, focal_length, cxy)
+        rott_geo = forward_rott(geometry, euler_angle, trans)
+        proj_geo = camera.transform_points_screen(rott_geo, image_size=((h, w),))
         loss_lan = cal_lan_loss(proj_geo[:, :, :2], lms[sel_ids].detach())
         loss_regid = torch.mean(id_para * id_para)
         loss_regexp = torch.mean(exp_para * exp_para)
@@ -153,28 +163,31 @@ for focal in range(600, 1500, 100):
         loss.backward()
         optimizer_idexp.step()
         optimizer_frame.step()
-        if iter % 100 == 0 and False:
-            print(
-                focal,
-                "poseidexp",
-                iter,
-                loss_lan.item(),
-                loss_regid.item(),
-                loss_regexp.item(),
-            )
+        if iter % 100 == 0:
+            # print(
+            #     focal,
+            #     "poseidexp",
+            #     iter,
+            #     loss_lan.item(),
+            #     loss_regid.item(),
+            #     loss_regexp.item(),
+            # )
+            print(f"Curr Lmk Loss: {loss_lan.item()}")
         if iter % 1500 == 0 and iter >= 1500:
             for param_group in optimizer_idexp.param_groups:
                 param_group["lr"] *= 0.2
             for param_group in optimizer_frame.param_groups:
                 param_group["lr"] *= 0.2
-    print(focal, loss_lan.item(), torch.mean(trans[:, 2]).item())
+    print(
+        f"Loss for focal length:  {focal}, LMKLoss: {loss_lan.item()}, Mean-Trans:{torch.mean(trans[:, 2]).item()}"
+    )
 
     if loss_lan.item() < arg_landis:
         arg_landis = loss_lan.item()
         arg_focal = focal
 
 print("find best focal", arg_focal)
-
+camera = get_camera(arg_focal, img_h=h, img_w=w, device=device)
 id_para = lms.new_zeros((1, id_dim), requires_grad=True).to(device)
 exp_para = lms.new_zeros((num_frames, exp_dim), requires_grad=True).to(device)
 pose_global = lms.new_zeros((num_frames, 3), requires_grad=False).to(device)
@@ -186,13 +199,13 @@ euler_angle = lms.new_zeros((num_frames, 3), requires_grad=True).to(device)
 trans = lms.new_zeros((num_frames, 3), requires_grad=True).to(device)
 light_para = lms.new_zeros((num_frames, 27), requires_grad=True).to(device)
 trans.data[:, 2] -= 7
-focal_length = lms.new_zeros(1, requires_grad=True).to(device)
+focal_length = lms.new_zeros(1, requires_grad=False).to(device)
 focal_length.data += arg_focal
 
 set_requires_grad([id_para, exp_para, tex_para, euler_angle, trans, light_para])
 
-optimizer_idexp = torch.optim.Adam([id_para, exp_para, pose_jaw], lr=0.1)
-optimizer_frame = torch.optim.Adam([euler_angle, trans], lr=1)
+optimizer_idexp = torch.optim.Adam([id_para, exp_para, pose_jaw], lr=0.1)  # lr was 0.1
+optimizer_frame = torch.optim.Adam([euler_angle, trans], lr=0.1)
 
 for iter in range(1500):
     id_para_batch = einops.repeat(id_para, "b d -> (repeat b) d", repeat=num_frames)
@@ -204,7 +217,9 @@ for iter in range(1500):
         translation=trans_flame,
     )
     geometry = T_ROT_Y.transform_points(_geometry)
-    proj_geo = forward_transform(geometry, euler_angle, trans, focal_length, cxy)
+    # proj_geo = forward_transform(geometry, euler_angle, trans, focal_length, cxy)
+    rott_geo = forward_rott(geometry, euler_angle, trans)
+    proj_geo = camera.transform_points_screen(rott_geo, image_size=((h, w),))
     loss_lan = cal_lan_loss(proj_geo[:, :, :2], lms.detach())
     loss = loss_lan
     optimizer_frame.zero_grad()
@@ -213,8 +228,8 @@ for iter in range(1500):
     if iter == 1000:
         for param_group in optimizer_frame.param_groups:
             param_group["lr"] = 0.1
-    if iter % 100 == 0 and False:
-        print("pose", iter, loss.item())
+    if iter % 100 == 0:
+        print(f"CAM Opt iter: {iter}, LMKLoss: {loss_lan.item()}")
 
 for param_group in optimizer_frame.param_groups:
     param_group["lr"] = 0.1
@@ -228,7 +243,9 @@ for iter in range(2000):
         translation=trans_flame,
     )
     geometry = T_ROT_Y.transform_points(_geometry)
-    proj_geo = forward_transform(geometry, euler_angle, trans, focal_length, cxy)
+    # proj_geo = forward_transform(geometry, euler_angle, trans, focal_length, cxy)
+    rott_geo = forward_rott(geometry, euler_angle, trans)
+    proj_geo = camera.transform_points_screen(rott_geo, image_size=((h, w),))
     loss_lan = cal_lan_loss(proj_geo[:, :, :2], lms.detach())
     loss_regid = torch.mean(id_para * id_para)
     loss_regexp = torch.mean(exp_para * exp_para)
@@ -238,15 +255,130 @@ for iter in range(2000):
     loss.backward()
     optimizer_idexp.step()
     optimizer_frame.step()
-    if iter % 100 == 0 and False:
-        print("poseidexp", iter, loss_lan.item(), loss_regid.item(), loss_regexp.item())
+    if iter % 100 == 0:
+        print(
+            f"CAM+EXP+ID Opt iter: {iter}, LMKLoss: {loss_lan.item()}, IDLoss:{loss_regid.item()}, EXPLoss: {loss_regexp.item()}"
+        )
     if iter % 1000 == 0 and iter >= 1000:
         for param_group in optimizer_idexp.param_groups:
             param_group["lr"] *= 0.2
         for param_group in optimizer_frame.param_groups:
             param_group["lr"] *= 0.2
-print(loss_lan.item(), torch.mean(trans[:, 2]).item())
+print(
+    "Full optimization Landmark losses: ",
+    loss_lan.item(),
+    torch.mean(trans[:, 2]).item(),
+)
 
+## SANITY CHECK
+SANITY_CHECK = True
+if SANITY_CHECK:
+    with torch.no_grad():
+        id_para_batch = id_para.expand(num_frames, -1)
+        _, _, _geometry = flame_model(
+            shape_params=id_para_batch,
+            expression_params=exp_para,
+            pose_params=pose_var,
+            translation=trans_flame,
+        )
+        geometry = T_ROT_Y.transform_points(_geometry)
+        # proj_geo = forward_transform(geometry, euler_angle, trans, focal_length, cxy)
+        rott_geo = forward_rott(geometry, euler_angle, trans)
+        proj_geo = camera.transform_points_screen(rott_geo, image_size=((h, w),))
+        loss_lan = cal_lan_loss(proj_geo[:, :, :2], lms.detach())
+        print(f"Sanity check LMK Loss: {loss_lan.item()}")
+        print(f"euler_angle shape: {euler_angle.shape}")
+        print(f"trans shape: {trans.shape}")
+        print(f"lms shape: {lms.shape}")
+        for i in range(num_frames):
+            id_para_batch = id_para.expand(num_frames, -1)[i][None]
+            _, _, _geometry = flame_model(
+                shape_params=id_para_batch,
+                expression_params=exp_para[i][None],
+                pose_params=pose_var[i][None],
+                translation=trans_flame[i][None],
+            )
+            geometry = T_ROT_Y.transform_points(_geometry)
+            # proj_geo = forward_transform(geometry, euler_angle, trans, focal_length, cxy)
+            rott_geo = forward_rott(geometry, euler_angle[i][None], trans[i][None])
+            proj_geo = camera.transform_points_screen(rott_geo, image_size=((h, w),))
+            loss_lan = cal_lan_loss(proj_geo[:, :, :2], lms[i][None].detach())
+            if i % 100 == 0:
+                print(f"Sanity check LMK Loss for iter {i}: {loss_lan.item()}")
+##
+
+VIS_IMAGES = True
+with torch.no_grad():
+    if VIS_IMAGES:
+        VIS_DIR = Path(f"./data_util/optimize_vis/{args.idname}")
+        VIS_DIR.mkdir(exist_ok=True, parents=True)
+        device_render = torch.device("cuda:0")
+        batch_size = 1
+        _verts, faces, aux = load_obj(deca_cfg.model.topology_path)
+        faces_verts_idx = faces.verts_idx[None, ...]
+        renderer = Render_3DMM_no_tex(
+            # arg_focal,
+            h,
+            w,
+            camera=camera,
+            batch_size=1,
+            faces_verts_idx=faces_verts_idx,
+            device=device_render,
+        )
+        sel_ids = np.arange(exp_para.shape[0])
+        imgs = []
+        for sel_id in sel_ids:
+            imgs.append(cv2.imread(img_paths[sel_id])[:, :, ::-1])
+        imgs = np.stack(imgs)
+        sel_imgs = torch.as_tensor(imgs).cuda()
+        id_para_batch = id_para.expand(num_frames, -1)
+        batch_geometry, _, batch_lmk_3d = flame_model(
+            shape_params=id_para_batch,
+            expression_params=exp_para,
+            pose_params=pose_var,
+            translation=trans_flame,
+        )
+        batch_geometry = T_ROT_Y.transform_points(batch_geometry)
+        batch_lmk_3d = T_ROT_Y.transform_points(batch_lmk_3d)
+        for sel_id in tqdm.tqdm(np.arange(num_frames)):
+            geometry = batch_geometry[sel_id][None]
+            lmk3d = batch_lmk_3d[sel_id][None]
+            rott_geo = forward_rott(
+                geometry, euler_angle[sel_id][None], trans[sel_id][None]
+            )
+            rott_lmk3d = forward_rott(
+                lmk3d, euler_angle[sel_id][None], trans[sel_id][None]
+            )
+            lmk3d_screen = camera.transform_points_screen(
+                rott_lmk3d, image_size=((h, w),)
+            )
+            loss_lan = cal_lan_loss(lmk3d_screen[:, :, :2], lms[sel_id][None].detach())
+
+            render_imgs = (
+                renderer(
+                    rott_geo.to(device_render),
+                    # geometry.to(device_render),
+                )
+                / 255.0
+            )
+            img_name = f"Overlay_{sel_id:04d}.png"
+            if sel_id % 100 == 0:
+                print(f"Image Name: {img_name}, Loss Lmk: {loss_lan.item()}")
+            curr_render_img = render_imgs[0].clone().detach().cpu().numpy()[..., :3]
+            io.imsave(
+                VIS_DIR / img_name,
+                (
+                    (
+                        0.7 * curr_render_img
+                        + 0.3
+                        * (sel_imgs[sel_id].clone().detach().cpu().numpy() / 255.0)
+                    )
+                    * 255
+                ).astype(np.uint8),
+            )
+        # print(f"Image saved at: {VIS_DIR / img_name}")
+
+# Cmd: python data_util/face_tracking/face_tracker.py --idname=Obama --img_h=450 --img_w=450 --frame_num=100000
 ## Temporarily commented out photometric optimization
 
 # batch_size = 50

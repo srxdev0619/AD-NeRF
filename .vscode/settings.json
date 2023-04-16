@@ -1,0 +1,18 @@
+{
+"workbench.colorCustomizations": {
+        "[Mayukai Semantic Mirage]": {
+        "editor.background": "#000000",
+        "editor.foreground": "#ffffff", 
+        "foreground": "#ffffff",
+        "editor.wordHighlightTextBorder": "#ff0000ff", 
+        "editor.findMatchBorder": "#ffff00ff",
+        "editor.findMatchHighlightBorder": "#00ff80ff",  
+    },
+    "[Monokai]": {
+        "editor.background": "#000000",
+        "editor.foreground": "#ffffff", 
+        "foreground": "#ffffff",
+    },    
+      
+},
+}
