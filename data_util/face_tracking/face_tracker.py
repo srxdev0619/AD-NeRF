@@ -102,8 +102,7 @@ sel_num = sel_ids.shape[0]
 arg_focal = 1600
 arg_landis = 1e5
 
-# for focal in range(600, 1500, 100):
-for focal in [600]:
+for focal in range(600, 1500, 100):
     id_para = lms.new_zeros((1, id_dim), requires_grad=True).to(device)
     exp_para = lms.new_zeros((sel_num, exp_dim), requires_grad=True).to(device)
     pose_global = lms.new_zeros((sel_num, 3), requires_grad=False).to(device)
@@ -249,7 +248,7 @@ for iter in range(2000):
     loss_lan = cal_lan_loss(proj_geo[:, :, :2], lms.detach())
     loss_regid = torch.mean(id_para * id_para)
     loss_regexp = torch.mean(exp_para * exp_para)
-    loss = loss_lan + loss_regid * 0.5 + loss_regexp * 0.4
+    loss = loss_lan + 5.0 * loss_regid + loss_regexp * 0.4
     optimizer_idexp.zero_grad()
     optimizer_frame.zero_grad()
     loss.backward()
